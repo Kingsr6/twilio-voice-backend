@@ -4,14 +4,10 @@ const twilio = require("twilio");
 
 const app = express();
 
-// Middleware
-app.use(cors({ origin: "*" }));
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// ===============================
-// ENV VARIABLES (Render)
-// ===============================
 const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
@@ -21,17 +17,11 @@ const {
   TWILIO_CALLER_ID,
 } = process.env;
 
-// ===============================
-// HEALTH CHECK
-// ===============================
 app.get("/", (req, res) => {
-  res.send("Twilio backend is running");
+  res.send("Twilio backend running");
 });
 
-// ===============================
-// 1. GET /token
-// (Used by BASE44 / Twilio Voice SDK)
-// ===============================
+// TOKEN
 app.get("/token", (req, res) => {
   try {
     const identity = req.query.identity || "user";
@@ -53,46 +43,34 @@ app.get("/token", (req, res) => {
 
     token.addGrant(voiceGrant);
 
-    res.json({
-      identity,
-      token: token.toJwt(),
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.json({ token: token.toJwt(), identity });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ===============================
-// 2. POST /voice
-// (Twilio webhook - connects the call)
-// ===============================
+// VOICE
 app.post("/voice", (req, res) => {
-  try {
-    const twiml = new twilio.twiml.VoiceResponse();
+  const twiml = new twilio.twiml.VoiceResponse();
 
-    const toNumber = req.body.To;
+  const to = req.body.To;
 
-    if (toNumber) {
-      const dial = twiml.dial({
-        callerId: TWILIO_CALLER_ID,
-        answerOnBridge: true,
-      });
+  if (to) {
+    const dial = twiml.dial({
+      callerId: TWILIO_CALLER_ID,
+      answerOnBridge: true,
+    });
 
-      dial.number(toNumber);
-    } else {
-      twiml.say("No destination number provided.");
-    }
-
-    res.type("text/xml");
-    res.send(twiml.toString());
-  } catch (error) {
-    res.status(500).send(error.message);
+    dial.number(to);
+  } else {
+    twiml.say("No number provided");
   }
+
+  res.type("text/xml");
+  res.send(twiml.toString());
 });
 
-// ===============================
-// START SERVER
-// ===============================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {

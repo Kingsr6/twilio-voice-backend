@@ -1,4 +1,5 @@
 {
+  "@base44/sdk": "^latest"
   "name": "twilio-backend",
   "version": "1.0.0",
   "main": "index.js",
@@ -9,6 +10,5 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "twilio": "^5.0.0"
-    "@base44/sdk": "^latest"
   }
 }

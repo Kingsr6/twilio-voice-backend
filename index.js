@@ -127,10 +127,10 @@ app.post("/verify-payment", async (req, res) => {
       return res.json({ verified: true, message: "Already credited." });
     }
 
-    // 3. Credit the user's wallet (NGN → USD)
+    // 3. Credit the user's wallet (NGN)
     const user = await base44.entities.User.get(user_id);
-    const newBalance = parseFloat(((user.balance ?? 0) + Number(expected_amount) * NGN_TO_USD).toFixed(4));
-    await base44.entities.User.update(user_id, { balance: newBalance });
+const newBalance = parseFloat(((user.balance ?? 0) + Number(expected_amount)).toFixed(2));
+await base44.entities.User.update(user_id, { balance: newBalance });
 
     // 4. Mark transaction successful
     await base44.entities.WalletTransaction.update(txn_record_id, {

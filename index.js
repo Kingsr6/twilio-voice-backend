@@ -50,17 +50,28 @@ app.get("/token", (req, res) => {
   }
 });
 
-// VOICE
-app.post("/voice", (req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-
+// app.post('/voice', (req, res) => {
   const to = req.body.To;
+  // ... always uses <Number>
+});
+Replace it with this:
+app.post('/voice', (req, res) => {
+  const to = req.body.To || '';
+  const callerId = process.env.TWILIO_CALLER_ID || '+18384445450';
 
-  if (to) {
-    const dial = twiml.dial({
-      callerId: TWILIO_CALLER_ID,
-      answerOnBridge: true,
-    });
+  let twiml;
+  if (to.startsWith('client:')) {
+    // User-to-user call
+    const clientId = to.replace('client:', '');
+    twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Dial callerId="' + callerId + '" answerOnBridge="true"><Client>' + clientId + '</Client></Dial></Response>';
+  } else {
+    // External phone call
+    twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Dial callerId="' + callerId + '" answerOnBridge="true"><Number>' + to + '</Number></Dial></Response>';
+  }
+
+  res.type('text/xml');
+  res.send(twiml);
+});
 
     dial.number(to);
   } else {

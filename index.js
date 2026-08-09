@@ -50,36 +50,33 @@ app.get("/token", (req, res) => {
   }
 });
 
-// app.post('/voice', (req, res) => {
-  const to = req.body.To;
-  // ... always uses <Number>
-});
-Replace it with this:
-app.post('/voice', (req, res) => {
-  const to = req.body.To || '';
-  const callerId = process.env.TWILIO_CALLER_ID || '+18384445450';
+// VOICE — routes user-to-user (client) and external (number) calls
+app.post("/voice", (req, res) => {
+  const to = req.body.To || "";
+  const callerId = process.env.TWILIO_CALLER_ID || "+18384445450";
 
   let twiml;
-  if (to.startsWith('client:')) {
+  if (to.startsWith("client:")) {
     // User-to-user call
-    const clientId = to.replace('client:', '');
-    twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Dial callerId="' + callerId + '" answerOnBridge="true"><Client>' + clientId + '</Client></Dial></Response>';
+    const clientId = to.replace("client:", "");
+    twiml =
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Dial callerId="' +
+      callerId +
+      '" answerOnBridge="true"><Client>' +
+      clientId +
+      "</Client></Dial></Response>";
   } else {
     // External phone call
-    twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Dial callerId="' + callerId + '" answerOnBridge="true"><Number>' + to + '</Number></Dial></Response>';
-  }
-
-  res.type('text/xml');
-  res.send(twiml);
-});
-
-    dial.number(to);
-  } else {
-    twiml.say("No number provided");
+    twiml =
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Dial callerId="' +
+      callerId +
+      '" answerOnBridge="true"><Number>' +
+      to +
+      "</Number></Dial></Response>";
   }
 
   res.type("text/xml");
-  res.send(twiml.toString());
+  res.send(twiml);
 });
 
 const PORT = process.env.PORT || 3000;
@@ -87,7 +84,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });
-
 
 // Render backend (Express) — install: npm i @base44/sdk
 const { createClient } = require("@base44/sdk");
@@ -112,7 +108,6 @@ app.post("/verify-payment", async (req, res) => {
   }
 
   try {
-    // 1. Verify the real transaction with Flutterwave (secret key)
     const flwRes = await fetch(
       `https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref__=${encodeURIComponent(tx_ref)}`,
       { headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` } }
@@ -132,18 +127,15 @@ app.post("/verify-payment", async (req, res) => {
 
     const base44 = await getBase44();
 
-    // 2. Idempotency — skip if already credited
     const existing = await base44.entities.WalletTransaction.get(txn_record_id);
     if (existing && existing.status === "successful") {
       return res.json({ verified: true, message: "Already credited." });
     }
 
-    // 3. Credit the user's wallet (NGN)
     const user = await base44.entities.User.get(user_id);
-const newBalance = parseFloat(((user.balance ?? 0) + Number(expected_amount)).toFixed(2));
-await base44.entities.User.update(user_id, { balance: newBalance });
+    const newBalance = parseFloat(((user.balance ?? 0) + Number(expected_amount)).toFixed(2));
+    await base44.entities.User.update(user_id, { balance: newBalance });
 
-    // 4. Mark transaction successful
     await base44.entities.WalletTransaction.update(txn_record_id, {
       status: "successful",
       flw_reference: flw_ref || txn.flw_ref || "",
@@ -152,7 +144,6 @@ await base44.entities.User.update(user_id, { balance: newBalance });
 
     return res.json({ verified: true, balance: newBalance });
   } catch (e) {
-    // If token expired, force re-login and retry once
     try {
       _client = null;
       const base44 = await getBase44();

@@ -81,6 +81,15 @@ async function initSchema() {
       created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS migration_audit (
+      user_id              TEXT PRIMARY KEY,
+      old_base44_balance   NUMERIC(12,2) NOT NULL,
+      migrated_pg_balance  NUMERIC(12,2) NOT NULL DEFAULT 0,
+      status               TEXT NOT NULL,
+      error_message        TEXT,
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_payment_intents_user
       ON payment_intents(user_id);
 
@@ -92,14 +101,20 @@ async function initSchema() {
 
     CREATE INDEX IF NOT EXISTS idx_call_charges_user
       ON call_charges(user_id);
+
+    CREATE INDEX IF NOT EXISTS idx_migration_audit_status
+      ON migration_audit(status);
   `);
 
   console.log("[wallet] PostgreSQL schema ready");
 }
 
-// Every wallet request waits until the schema exists.
 const schemaReady = initSchema().catch((error) => {
-  console.error("[wallet] Schema initialization failed:", error);
+  console.error(
+    "[wallet] Schema initialization failed:",
+    error
+  );
+
   process.exit(1);
 });
 
@@ -121,7 +136,8 @@ async function getCreateClient() {
 async function authMiddleware(req, res, next) {
   await schemaReady;
 
-  const authHeader = req.headers.authorization || "";
+  const authHeader =
+    req.headers.authorization || "";
 
   if (!authHeader.startsWith("Bearer ")) {
     return res.status(401).json({
@@ -129,7 +145,9 @@ async function authMiddleware(req, res, next) {
     });
   }
 
-  const token = authHeader.slice("Bearer ".length).trim();
+  const token = authHeader
+    .slice("Bearer ".length)
+    .trim();
 
   if (!token) {
     return res.status(401).json({
@@ -138,8 +156,8 @@ async function authMiddleware(req, res, next) {
   }
 
   // IMPORTANT:
-  // The browser cannot choose the app ID.
-  // Render uses its own trusted environment variable.
+  // Never trust X-App-Id from the browser.
+  // Render uses the server-side environment variable.
   const appId = BASE44_APP_ID;
 
   if (!appId) {
@@ -149,7 +167,8 @@ async function authMiddleware(req, res, next) {
   }
 
   try {
-    const createClient = await getCreateClient();
+    const createClient =
+      await getCreateClient();
 
     const base44 = createClient({
       appId,
@@ -157,7 +176,8 @@ async function authMiddleware(req, res, next) {
       serverUrl: "https://base44.app",
     });
 
-    const user = await base44.auth.me();
+    const user =
+      await base44.auth.me();
 
     if (!user || !user.id) {
       return res.status(401).json({
@@ -165,12 +185,13 @@ async function authMiddleware(req, res, next) {
       });
     }
 
-    // Canonical identity comes from Base44.
+    // Canonical identity comes ONLY from
+    // the validated Base44 token.
     req.authUserId = user.id;
     req.base44Client = base44;
     req.authUser = user;
 
-    next();
+    return next();
   } catch (error) {
     console.error(
       "[wallet/auth] Token validation failed:",
@@ -183,7 +204,7 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-// ALL wallet endpoints require authentication.
+// All wallet routes require authentication.
 router.use(authMiddleware);
 
 // ============================================================
@@ -243,16 +264,21 @@ function detectNetwork(phoneNumber) {
     return "Other";
   }
 
-  let number = String(phoneNumber).trim();
+  let number = String(phoneNumber)
+    .trim();
 
-  // +2348012345678 -> 08012345678
+  // Convert +2348012345678 → 08012345678
   number = number
     .replace(/^\+234/, "0")
     .replace(/^234/, "0");
 
-  const prefix = number.substring(0, 4);
+  const prefix =
+    number.substring(0, 4);
 
-  for (const [network, prefixes] of Object.entries(
+  for (const [
+    network,
+    prefixes,
+  ] of Object.entries(
     NETWORK_PREFIXES
   )) {
     if (prefixes.includes(prefix)) {
@@ -271,23 +297,29 @@ function detectNetwork(phoneNumber) {
 let ratesCache = null;
 let ratesCacheTime = 0;
 
-const RATES_TTL_MS = 5 * 60 * 1000;
+const RATES_TTL_MS =
+  5 * 60 * 1000;
 
-async function getRates(base44Client) {
+async function getRates(
+  base44Client
+) {
   const now = Date.now();
 
   if (
     ratesCache &&
-    now - ratesCacheTime < RATES_TTL_MS
+    now - ratesCacheTime <
+      RATES_TTL_MS
   ) {
     return ratesCache;
   }
 
   const rates =
-    await base44Client.entities.CallRate.filter({
-      country: "Nigeria",
-      active: true,
-    });
+    await base44Client.entities.CallRate.filter(
+      {
+        country: "Nigeria",
+        active: true,
+      }
+    );
 
   ratesCache = rates || [];
   ratesCacheTime = now;
@@ -299,15 +331,16 @@ async function getRateForNetwork(
   base44Client,
   network
 ) {
-  const rates = await getRates(base44Client);
+  const rates =
+    await getRates(base44Client);
 
-  const rate = rates.find(
-    (item) =>
-      item.network === network &&
-      item.active === true
+  return (
+    rates.find(
+      (rate) =>
+        rate.network === network &&
+        rate.active === true
+    ) || null
   );
-
-  return rate || null;
 }
 
 // ============================================================
@@ -319,17 +352,23 @@ const BILLING_INCREMENT_SECONDS = 60;
 function calculateBilledMinutes(
   durationSeconds
 ) {
-  const seconds = Number(durationSeconds);
+  const seconds =
+    Number(durationSeconds);
 
-  if (!Number.isFinite(seconds) || seconds <= 0) {
+  if (
+    !Number.isFinite(seconds) ||
+    seconds <= 0
+  ) {
     return 0;
   }
 
   return (
     Math.ceil(
-      seconds / BILLING_INCREMENT_SECONDS
+      seconds /
+        BILLING_INCREMENT_SECONDS
     ) *
-    (BILLING_INCREMENT_SECONDS / 60)
+    (BILLING_INCREMENT_SECONDS /
+      60)
   );
 }
 
@@ -349,12 +388,18 @@ function calculateCost(
 // WALLET HELPER
 // ============================================================
 
-async function ensureWallet(userId) {
+async function ensureWallet(
+  userId
+) {
   await pool.query(
     `
-      INSERT INTO wallets (user_id, balance)
+      INSERT INTO wallets (
+        user_id,
+        balance
+      )
       VALUES ($1, 0)
-      ON CONFLICT (user_id) DO NOTHING
+      ON CONFLICT (user_id)
+      DO NOTHING
     `,
     [userId]
   );
@@ -368,20 +413,24 @@ router.get(
   "/wallet/balance",
   async (req, res) => {
     try {
-      await ensureWallet(req.authUserId);
-
-      const result = await pool.query(
-        `
-          SELECT balance
-          FROM wallets
-          WHERE user_id = $1
-        `,
-        [req.authUserId]
+      await ensureWallet(
+        req.authUserId
       );
+
+      const result =
+        await pool.query(
+          `
+            SELECT balance
+            FROM wallets
+            WHERE user_id = $1
+          `,
+          [req.authUserId]
+        );
 
       return res.json({
         balance: Number(
-          result.rows[0]?.balance || 0
+          result.rows[0]
+            ?.balance || 0
         ),
         currency: "NGN",
       });
@@ -392,7 +441,8 @@ router.get(
       );
 
       return res.status(500).json({
-        error: "Could not retrieve wallet balance.",
+        error:
+          "Could not retrieve wallet balance.",
       });
     }
   }
@@ -401,22 +451,26 @@ router.get(
 // ============================================================
 // POST /wallet/intent
 //
-// Render creates the tx_ref.
-// Browser does NOT create the payment reference.
+// Server creates the payment reference.
+// Browser cannot choose the tx_ref.
 // ============================================================
 
 router.post(
   "/wallet/intent",
   async (req, res) => {
-    const amount = Number(req.body.amount);
-    const userId = req.authUserId;
+    const amount =
+      Number(req.body.amount);
+
+    const userId =
+      req.authUserId;
 
     if (
       !Number.isFinite(amount) ||
       amount < 100
     ) {
       return res.status(400).json({
-        error: "Minimum wallet funding amount is ₦100.",
+        error:
+          "Minimum wallet funding amount is ₦100.",
       });
     }
 
@@ -436,25 +490,30 @@ router.post(
         .slice(2, 10);
 
     const txRef =
-      `GCWALLET-${userId.slice(0, 8)}-` +
-      `${Date.now()}-` +
-      Math.random()
+      `GCWALLET-${userId.slice(
+        0,
+        8
+      )}-${Date.now()}-${Math.random()
         .toString(36)
-        .slice(2, 10);
+        .slice(2, 10)}`;
 
     try {
       await pool.query(
         `
-          INSERT INTO payment_intents
-          (
+          INSERT INTO payment_intents (
             id,
             user_id,
             amount,
             tx_ref,
             status
           )
-          VALUES
-          ($1, $2, $3, $4, 'pending')
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            'pending'
+          )
         `,
         [
           intentId,
@@ -477,7 +536,8 @@ router.post(
       );
 
       return res.status(500).json({
-        error: "Could not create payment intent.",
+        error:
+          "Could not create payment intent.",
       });
     }
   }
@@ -486,7 +546,7 @@ router.post(
 // ============================================================
 // POST /wallet/credit
 //
-// Secure Flutterwave wallet credit.
+// Secure Flutterwave credit.
 // ============================================================
 
 router.post(
@@ -498,9 +558,13 @@ router.post(
       flw_ref,
     } = req.body;
 
-    const userId = req.authUserId;
+    const userId =
+      req.authUserId;
 
-    if (!tx_ref || !transaction_id) {
+    if (
+      !tx_ref ||
+      !transaction_id
+    ) {
       return res.status(400).json({
         error:
           "tx_ref and transaction_id are required.",
@@ -529,7 +593,9 @@ router.post(
           [String(tx_ref)]
         );
 
-      if (intentResult.rows.length === 0) {
+      if (
+        intentResult.rows.length === 0
+      ) {
         return res.status(404).json({
           credited: false,
           error:
@@ -544,7 +610,9 @@ router.post(
       // 2. Verify ownership
       // --------------------------------------------------------
 
-      if (intent.user_id !== userId) {
+      if (
+        intent.user_id !== userId
+      ) {
         return res.status(403).json({
           credited: false,
           error:
@@ -553,11 +621,16 @@ router.post(
       }
 
       // --------------------------------------------------------
-      // 3. Idempotency
+      // 3. Already credited?
       // --------------------------------------------------------
 
-      if (intent.status === "credited") {
-        await ensureWallet(userId);
+      if (
+        intent.status ===
+        "credited"
+      ) {
+        await ensureWallet(
+          userId
+        );
 
         const balanceResult =
           await pool.query(
@@ -572,15 +645,93 @@ router.post(
         return res.json({
           credited: true,
           idempotent: true,
-          amount: Number(intent.amount),
+          amount: Number(
+            intent.amount
+          ),
           newBalance: Number(
-            balanceResult.rows[0]?.balance || 0
+            balanceResult.rows[0]
+              ?.balance || 0
           ),
         });
       }
 
       // --------------------------------------------------------
-      // 4. Verify Flutterwave transaction
+      // 4. Cross-account transaction protection
+      // --------------------------------------------------------
+
+      const existingCredit =
+        await pool.query(
+          `
+            SELECT *
+            FROM funding_credits
+            WHERE flw_transaction_id = $1
+          `,
+          [String(transaction_id)]
+        );
+
+      if (
+        existingCredit.rows.length >
+        0
+      ) {
+        const existing =
+          existingCredit.rows[0];
+
+        if (
+          existing.user_id !==
+          userId
+        ) {
+          return res.status(403).json({
+            credited: false,
+            error:
+              "This transaction was already claimed by another account.",
+          });
+        }
+
+        await pool.query(
+          `
+            UPDATE payment_intents
+            SET
+              status = 'credited',
+              flw_transaction_id = $1,
+              credited_at = NOW()
+            WHERE id = $2
+              AND status = 'pending'
+          `,
+          [
+            String(transaction_id),
+            intent.id,
+          ]
+        );
+
+        await ensureWallet(
+          userId
+        );
+
+        const balanceResult =
+          await pool.query(
+            `
+              SELECT balance
+              FROM wallets
+              WHERE user_id = $1
+            `,
+            [userId]
+          );
+
+        return res.json({
+          credited: true,
+          idempotent: true,
+          amount: Number(
+            existing.amount
+          ),
+          newBalance: Number(
+            balanceResult.rows[0]
+              ?.balance || 0
+          ),
+        });
+      }
+
+      // --------------------------------------------------------
+      // 5. Verify with Flutterwave
       // --------------------------------------------------------
 
       const verifyResponse =
@@ -635,7 +786,7 @@ router.post(
       }
 
       // --------------------------------------------------------
-      // 5. tx_ref MUST match
+      // 6. tx_ref MUST match
       // --------------------------------------------------------
 
       if (
@@ -650,29 +801,33 @@ router.post(
       }
 
       // --------------------------------------------------------
-      // 6. Amount MUST match
+      // 7. Amount MUST match intent
       // --------------------------------------------------------
 
-      const paidAmount = Number(
-        transaction.amount
-      );
+      const paidAmount =
+        Number(
+          transaction.amount
+        );
 
-      const expectedAmount = Number(
-        intent.amount
-      );
+      const expectedAmount =
+        Number(intent.amount);
 
       if (
-        !Number.isFinite(paidAmount) ||
-        paidAmount !== expectedAmount
+        !Number.isFinite(
+          paidAmount
+        ) ||
+        paidAmount !==
+          expectedAmount
       ) {
         return res.status(400).json({
           credited: false,
-          error: "Payment amount mismatch.",
+          error:
+            "Payment amount mismatch.",
         });
       }
 
       // --------------------------------------------------------
-      // 7. Currency MUST be NGN
+      // 8. Currency MUST be NGN
       // --------------------------------------------------------
 
       if (
@@ -683,75 +838,6 @@ router.post(
           credited: false,
           error:
             "Payment currency must be NGN.",
-        });
-      }
-
-      // --------------------------------------------------------
-      // 8. Check transaction wasn't already credited
-      // --------------------------------------------------------
-
-      const existingCredit =
-        await pool.query(
-          `
-            SELECT *
-            FROM funding_credits
-            WHERE flw_transaction_id = $1
-          `,
-          [String(transaction_id)]
-        );
-
-      if (
-        existingCredit.rows.length > 0
-      ) {
-        const existing =
-          existingCredit.rows[0];
-
-        if (
-          existing.user_id !==
-          userId
-        ) {
-          return res.status(403).json({
-            credited: false,
-            error:
-              "This transaction was already claimed by another account.",
-          });
-        }
-
-        await pool.query(
-          `
-            UPDATE payment_intents
-            SET
-              status = 'credited',
-              flw_transaction_id = $1,
-              credited_at = NOW()
-            WHERE id = $2
-              AND status = 'pending'
-          `,
-          [
-            String(transaction_id),
-            intent.id,
-          ]
-        );
-
-        await ensureWallet(userId);
-
-        const balanceResult =
-          await pool.query(
-            `
-              SELECT balance
-              FROM wallets
-              WHERE user_id = $1
-            `,
-            [userId]
-          );
-
-        return res.json({
-          credited: true,
-          idempotent: true,
-          amount: expectedAmount,
-          newBalance: Number(
-            balanceResult.rows[0]?.balance || 0
-          ),
         });
       }
 
@@ -777,8 +863,7 @@ router.post(
 
         await client.query(
           `
-            INSERT INTO wallets
-            (
+            INSERT INTO wallets (
               user_id,
               balance
             )
@@ -805,8 +890,7 @@ router.post(
 
         await client.query(
           `
-            INSERT INTO funding_credits
-            (
+            INSERT INTO funding_credits (
               id,
               user_id,
               amount,
@@ -814,8 +898,14 @@ router.post(
               flw_transaction_id,
               flw_ref
             )
-            VALUES
-            ($1, $2, $3, $4, $5, $6)
+            VALUES (
+              $1,
+              $2,
+              $3,
+              $4,
+              $5,
+              $6
+            )
           `,
           [
             creditId,
@@ -860,7 +950,8 @@ router.post(
           return res.json({
             credited: true,
             idempotent: true,
-            amount: expectedAmount,
+            amount:
+              expectedAmount,
           });
         }
 
@@ -873,12 +964,14 @@ router.post(
         );
 
         if (
-          error.code === "23505"
+          error.code ===
+          "23505"
         ) {
           return res.json({
             credited: true,
             idempotent: true,
-            amount: expectedAmount,
+            amount:
+              expectedAmount,
           });
         }
 
@@ -886,10 +979,6 @@ router.post(
       } finally {
         client.release();
       }
-
-      // --------------------------------------------------------
-      // 10. Return new balance
-      // --------------------------------------------------------
 
       const balanceResult =
         await pool.query(
@@ -903,10 +992,11 @@ router.post(
 
       return res.json({
         credited: true,
-        amount: expectedAmount,
+        amount:
+          expectedAmount,
         newBalance: Number(
-          balanceResult.rows[0]?.balance ||
-            0
+          balanceResult.rows[0]
+            ?.balance || 0
         ),
       });
     } catch (error) {
@@ -979,9 +1069,11 @@ router.post(
           [req.authUserId]
         );
 
-      const balance = Number(
-        result.rows[0]?.balance || 0
-      );
+      const balance =
+        Number(
+          result.rows[0]
+            ?.balance || 0
+        );
 
       const ratePerMinute =
         Number(
@@ -989,7 +1081,8 @@ router.post(
         );
 
       if (
-        balance < ratePerMinute
+        balance <
+        ratePerMinute
       ) {
         return res.json({
           canCall: false,
@@ -1026,7 +1119,7 @@ router.post(
 // ============================================================
 // POST /wallet/charge
 //
-// Atomic, idempotent call billing.
+// Atomic and idempotent call billing.
 // ============================================================
 
 router.post(
@@ -1051,6 +1144,19 @@ router.post(
       return res.status(400).json({
         error:
           "call_log_id, destination_number and duration_seconds are required.",
+      });
+    }
+
+    const duration =
+      Number(duration_seconds);
+
+    if (
+      !Number.isFinite(duration) ||
+      duration < 0
+    ) {
+      return res.status(400).json({
+        error:
+          "duration_seconds must be a valid non-negative number.",
       });
     }
 
@@ -1081,19 +1187,21 @@ router.post(
           cost: Number(
             charge.amount
           ),
-          billedMinutes: Number(
-            charge.billed_minutes
-          ),
-          ratePerMinute: Number(
-            charge.rate_per_minute
-          ),
+          billedMinutes:
+            Number(
+              charge.billed_minutes
+            ),
+          ratePerMinute:
+            Number(
+              charge.rate_per_minute
+            ),
           network:
             charge.destination_network,
         });
       }
 
       // --------------------------------------------------------
-      // Rate
+      // Find rate
       // --------------------------------------------------------
 
       const network =
@@ -1122,9 +1230,7 @@ router.post(
 
       const billedMinutes =
         calculateBilledMinutes(
-          Number(
-            duration_seconds
-          )
+          duration
         );
 
       const cost =
@@ -1167,8 +1273,7 @@ router.post(
 
         await client.query(
           `
-            INSERT INTO wallets
-            (
+            INSERT INTO wallets (
               user_id,
               balance
             )
@@ -1212,8 +1317,7 @@ router.post(
 
         await client.query(
           `
-            INSERT INTO call_charges
-            (
+            INSERT INTO call_charges (
               id,
               user_id,
               call_log_id,
@@ -1226,8 +1330,19 @@ router.post(
               provider,
               provider_call_id
             )
-            VALUES
-            ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            VALUES (
+              $1,
+              $2,
+              $3,
+              $4,
+              $5,
+              $6,
+              $7,
+              $8,
+              $9,
+              $10,
+              $11
+            )
           `,
           [
             chargeId,
@@ -1235,9 +1350,7 @@ router.post(
             call_log_id,
             destination_number,
             network,
-            Number(
-              duration_seconds
-            ),
+            duration,
             billedMinutes,
             ratePerMinute,
             cost,
@@ -1255,7 +1368,6 @@ router.post(
           "ROLLBACK"
         );
 
-        // Another request won the race.
         if (
           error.code ===
           "23505"
@@ -1316,8 +1428,8 @@ router.post(
         charged: true,
         cost,
         newBalance: Number(
-          balanceResult.rows[0]?.balance ||
-            0
+          balanceResult.rows[0]
+            ?.balance || 0
         ),
         billedMinutes,
         ratePerMinute,
@@ -1394,6 +1506,720 @@ router.get(
         error:
           "Could not load wallet transactions.",
       });
+    }
+  }
+);
+
+// ============================================================
+// WALLET MIGRATION
+//
+// Base44 User.balance → Neon wallets.balance
+//
+// POST /wallet/migrate
+//
+// dry_run = true:
+//   READ ONLY. Writes NOTHING.
+//
+// dry_run = false:
+//   Performs one-time migration.
+//
+// Admin only.
+// ============================================================
+
+const MIGRATION_LOCK_KEY =
+  71489263;
+
+// ------------------------------------------------------------
+// Fetch ALL Base44 users using cursor pagination
+// ------------------------------------------------------------
+
+async function fetchAllBase44Users(
+  base44Client
+) {
+  const allUsers = [];
+
+  const batchSize = 500;
+
+  let lastDate = null;
+
+  while (true) {
+    let batch;
+
+    if (lastDate) {
+      batch =
+        await base44Client.entities.User.filter(
+          {
+            created_date: {
+              $lt: lastDate,
+            },
+          },
+          "-created_date",
+          batchSize
+        );
+    } else {
+      batch =
+        await base44Client.entities.User.list(
+          "-created_date",
+          batchSize
+        );
+    }
+
+    if (
+      !batch ||
+      batch.length === 0
+    ) {
+      break;
+    }
+
+    allUsers.push(...batch);
+
+    lastDate =
+      batch[batch.length - 1]
+        .created_date;
+
+    if (
+      batch.length < batchSize
+    ) {
+      break;
+    }
+  }
+
+  return allUsers;
+}
+
+// ------------------------------------------------------------
+// POST /wallet/migrate
+// ------------------------------------------------------------
+
+router.post(
+  "/wallet/migrate",
+  async (req, res) => {
+    await schemaReady;
+
+    const base44Client =
+      req.base44Client;
+
+    const dryRun =
+      req.body?.dry_run === true;
+
+    // ----------------------------------------------------------
+    // Admin-only
+    // ----------------------------------------------------------
+
+    if (
+      req.authUser?.role !==
+      "admin"
+    ) {
+      return res.status(403).json({
+        error:
+          "Admin access required.",
+      });
+    }
+
+    // ----------------------------------------------------------
+    // Advisory lock for real migrations
+    // ----------------------------------------------------------
+
+    let lockedClient = null;
+
+    if (!dryRun) {
+      lockedClient =
+        await pool.connect();
+
+      try {
+        const lockResult =
+          await lockedClient.query(
+            `
+              SELECT pg_try_advisory_lock($1)
+                AS locked
+            `,
+            [MIGRATION_LOCK_KEY]
+          );
+
+        if (
+          !lockResult.rows[0]
+            .locked
+        ) {
+          lockedClient.release();
+          lockedClient = null;
+
+          return res.status(409).json({
+            error:
+              "Another wallet migration is already running. Wait for it to finish, then try again.",
+          });
+        }
+      } catch (error) {
+        lockedClient.release();
+        lockedClient = null;
+
+        console.error(
+          "[migrate] Could not obtain migration lock:",
+          error
+        );
+
+        return res.status(500).json({
+          error:
+            "Could not obtain migration lock.",
+        });
+      }
+    }
+
+    // Dry run uses the pool directly.
+    // Real migration uses the locked connection.
+    const db =
+      lockedClient || pool;
+
+    const summary = {
+      dry_run: dryRun,
+
+      total_users: 0,
+
+      migrated: 0,
+      would_migrate: 0,
+
+      skipped_exists: 0,
+      skipped_no_balance: 0,
+      skipped_inactive: 0,
+
+      errors: 0,
+
+      total_ngn_migrated: 0,
+      total_base44_balance_scanned: 0,
+
+      error_details: [],
+    };
+
+    try {
+      // --------------------------------------------------------
+      // Get all users
+      // --------------------------------------------------------
+
+      const users =
+        await fetchAllBase44Users(
+          base44Client
+        );
+
+      summary.total_users =
+        users.length;
+
+      // --------------------------------------------------------
+      // Process each user
+      // --------------------------------------------------------
+
+      for (const user of users) {
+        const base44Balance =
+          Number(
+            user.balance ?? 0
+          );
+
+        const isInactive =
+          user.account_status ===
+          "inactive";
+
+        try {
+          // ------------------------------------------------------
+          // Checksum:
+          // only active users with positive balances are part
+          // of the amount that can actually be migrated.
+          // ------------------------------------------------------
+
+          if (
+            base44Balance > 0 &&
+            !isInactive
+          ) {
+            summary.total_base44_balance_scanned +=
+              base44Balance;
+          }
+
+          // ------------------------------------------------------
+          // Idempotency:
+          // check audit first.
+          // ------------------------------------------------------
+
+          const auditResult =
+            await db.query(
+              `
+                SELECT status
+                FROM migration_audit
+                WHERE user_id = $1
+              `,
+              [user.id]
+            );
+
+          if (
+            auditResult.rows
+              .length > 0
+          ) {
+            const previousStatus =
+              auditResult.rows[0]
+                .status;
+
+            if (
+              previousStatus ===
+                "migrated" ||
+              previousStatus ===
+                "skipped_exists"
+            ) {
+              summary.skipped_exists++;
+              continue;
+            }
+
+            // skipped_no_balance,
+            // skipped_inactive and error
+            // are re-evaluated.
+          }
+
+          // ------------------------------------------------------
+          // Inactive users:
+          // ALWAYS skip, even if balance > 0.
+          // ------------------------------------------------------
+
+          if (isInactive) {
+            summary.skipped_inactive++;
+
+            if (!dryRun) {
+              await db.query(
+                `
+                  INSERT INTO migration_audit (
+                    user_id,
+                    old_base44_balance,
+                    migrated_pg_balance,
+                    status
+                  )
+                  VALUES (
+                    $1,
+                    $2,
+                    0,
+                    'skipped_inactive'
+                  )
+                  ON CONFLICT (user_id)
+                  DO NOTHING
+                `,
+                [
+                  user.id,
+                  base44Balance,
+                ]
+              );
+            }
+
+            continue;
+          }
+
+          // ------------------------------------------------------
+          // Active user with zero balance.
+          // ------------------------------------------------------
+
+          if (
+            base44Balance <= 0
+          ) {
+            summary.skipped_no_balance++;
+
+            if (!dryRun) {
+              await db.query(
+                `
+                  INSERT INTO migration_audit (
+                    user_id,
+                    old_base44_balance,
+                    migrated_pg_balance,
+                    status
+                  )
+                  VALUES (
+                    $1,
+                    $2,
+                    0,
+                    'skipped_no_balance'
+                  )
+                  ON CONFLICT (user_id)
+                  DO NOTHING
+                `,
+                [
+                  user.id,
+                  base44Balance,
+                ]
+              );
+            }
+
+            continue;
+          }
+
+          // ------------------------------------------------------
+          // Read existing Neon wallet.
+          // ------------------------------------------------------
+
+          const walletResult =
+            await db.query(
+              `
+                SELECT balance
+                FROM wallets
+                WHERE user_id = $1
+              `,
+              [user.id]
+            );
+
+          const existingBalance =
+            walletResult.rows.length
+              ? Number(
+                  walletResult.rows[0]
+                    .balance
+                )
+              : null;
+
+          // ------------------------------------------------------
+          // Never overwrite an existing non-zero wallet.
+          // ------------------------------------------------------
+
+          if (
+            existingBalance !==
+              null &&
+            existingBalance > 0
+          ) {
+            summary.skipped_exists++;
+
+            if (!dryRun) {
+              await db.query(
+                `
+                  INSERT INTO migration_audit (
+                    user_id,
+                    old_base44_balance,
+                    migrated_pg_balance,
+                    status
+                  )
+                  VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    'skipped_exists'
+                  )
+                  ON CONFLICT (user_id)
+                  DO NOTHING
+                `,
+                [
+                  user.id,
+                  base44Balance,
+                  existingBalance,
+                ]
+              );
+            }
+
+            continue;
+          }
+
+          // ------------------------------------------------------
+          // Check Render/Neon activity.
+          // ------------------------------------------------------
+
+          const activityResult =
+            await db.query(
+              `
+                SELECT 1
+                FROM funding_credits
+                WHERE user_id = $1
+
+                UNION
+
+                SELECT 1
+                FROM call_charges
+                WHERE user_id = $1
+
+                LIMIT 1
+              `,
+              [user.id]
+            );
+
+          if (
+            activityResult.rows
+              .length > 0
+          ) {
+            summary.skipped_exists++;
+
+            if (!dryRun) {
+              const pgBalance =
+                existingBalance !==
+                null
+                  ? existingBalance
+                  : 0;
+
+              await db.query(
+                `
+                  INSERT INTO migration_audit (
+                    user_id,
+                    old_base44_balance,
+                    migrated_pg_balance,
+                    status
+                  )
+                  VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    'skipped_exists'
+                  )
+                  ON CONFLICT (user_id)
+                  DO NOTHING
+                `,
+                [
+                  user.id,
+                  base44Balance,
+                  pgBalance,
+                ]
+              );
+            }
+
+            continue;
+          }
+
+          // ------------------------------------------------------
+          // DRY RUN
+          // ------------------------------------------------------
+
+          if (dryRun) {
+            summary.would_migrate++;
+
+            summary.total_ngn_migrated +=
+              base44Balance;
+
+            continue;
+          }
+
+          // ------------------------------------------------------
+          // REAL MIGRATION
+          // ------------------------------------------------------
+
+          if (
+            existingBalance !==
+            null
+          ) {
+            // Existing wallet is zero.
+            // Update only if it is STILL zero.
+            await db.query(
+              `
+                UPDATE wallets
+                SET
+                  balance = $1,
+                  updated_at = NOW()
+                WHERE user_id = $2
+                  AND balance = 0
+              `,
+              [
+                base44Balance,
+                user.id,
+              ]
+            );
+          } else {
+            // No wallet exists.
+            await db.query(
+              `
+                INSERT INTO wallets (
+                  user_id,
+                  balance,
+                  updated_at
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  NOW()
+                )
+                ON CONFLICT (user_id)
+                DO NOTHING
+              `,
+              [
+                user.id,
+                base44Balance,
+              ]
+            );
+          }
+
+          // ------------------------------------------------------
+          // Read back the wallet.
+          // Never assume the previous write succeeded.
+          // ------------------------------------------------------
+
+          const verifyResult =
+            await db.query(
+              `
+                SELECT balance
+                FROM wallets
+                WHERE user_id = $1
+              `,
+              [user.id]
+            );
+
+          if (
+            verifyResult.rows
+              .length === 0
+          ) {
+            summary.errors++;
+
+            summary.error_details.push({
+              user_id: user.id,
+              error:
+                "Wallet not found after migration.",
+            });
+
+            continue;
+          }
+
+          const finalBalance =
+            Number(
+              verifyResult.rows[0]
+                .balance
+            );
+
+          // ------------------------------------------------------
+          // Successful migration
+          // ------------------------------------------------------
+
+          if (
+            finalBalance ===
+            base44Balance
+          ) {
+            summary.migrated++;
+
+            summary.total_ngn_migrated +=
+              base44Balance;
+
+            await db.query(
+              `
+                INSERT INTO migration_audit (
+                  user_id,
+                  old_base44_balance,
+                  migrated_pg_balance,
+                  status
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  $3,
+                  'migrated'
+                )
+                ON CONFLICT (user_id)
+                DO NOTHING
+              `,
+              [
+                user.id,
+                base44Balance,
+                finalBalance,
+              ]
+            );
+          } else {
+            // Something else changed the wallet.
+            // Do not count it as a migration.
+            summary.skipped_exists++;
+
+            await db.query(
+              `
+                INSERT INTO migration_audit (
+                  user_id,
+                  old_base44_balance,
+                  migrated_pg_balance,
+                  status
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  $3,
+                  'skipped_exists'
+                )
+                ON CONFLICT (user_id)
+                DO NOTHING
+              `,
+              [
+                user.id,
+                base44Balance,
+                finalBalance,
+              ]
+            );
+          }
+        } catch (error) {
+          summary.errors++;
+
+          summary.error_details.push({
+            user_id: user.id,
+            error: error.message,
+          });
+
+          if (!dryRun) {
+            await db.query(
+              `
+                INSERT INTO migration_audit (
+                  user_id,
+                  old_base44_balance,
+                  migrated_pg_balance,
+                  status,
+                  error_message
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  0,
+                  'error',
+                  $3
+                )
+                ON CONFLICT (user_id)
+                DO NOTHING
+              `,
+              [
+                user.id,
+                base44Balance,
+                error.message,
+              ]
+            ).catch(
+              () => {}
+            );
+          }
+        }
+      }
+
+      // --------------------------------------------------------
+      // Final validation
+      // --------------------------------------------------------
+
+      if (
+        !dryRun &&
+        summary.total_ngn_migrated >
+          summary.total_base44_balance_scanned
+      ) {
+        summary.validation_warning =
+          "Migrated total exceeds scanned Base44 total. Investigate before switching the frontend.";
+      }
+
+      return res.json(
+        summary
+      );
+    } catch (error) {
+      console.error(
+        "[migrate] Fatal error:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Migration failed: " +
+          error.message,
+        partial_summary:
+          summary,
+      });
+    } finally {
+      // ----------------------------------------------------------
+      // Release advisory lock
+      // ----------------------------------------------------------
+
+      if (lockedClient) {
+        try {
+          await lockedClient.query(
+            `
+              SELECT pg_advisory_unlock($1)
+            `,
+            [MIGRATION_LOCK_KEY]
+          );
+        } catch (error) {
+          console.error(
+            "[migrate] Failed to release advisory lock:",
+            error.message
+          );
+        }
+
+        lockedClient.release();
+      }
     }
   }
 );

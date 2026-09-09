@@ -22,7 +22,59 @@ const {
   TWILIO_API_SECRET,
   TWILIO_TWIML_APP_SID,
   TWILIO_CALLER_ID,
+  TWILIO_AUTH_TOKEN,
+  BASE44_APP_ID,
 } = process.env;
+
+// ============================================================
+// BASE44 AUTH FOR VOICE TOKEN
+// ============================================================
+
+let createBase44Client = null;
+
+async function getCreateClient() {
+  if (!createBase44Client) {
+    const module = await import("@base44/sdk");
+    createBase44Client = module.createClient;
+  }
+  return createBase44Client;
+}
+
+async function requireBase44User(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Missing authentication token" });
+  }
+
+  const token = authHeader.slice(7).trim();
+  if (!token) {
+    return res.status(401).json({ error: "Invalid authentication token" });
+  }
+
+  if (!BASE44_APP_ID) {
+    return res.status(500).json({ error: "BASE44_APP_ID is not configured" });
+  }
+
+  try {
+    const createClient = await getCreateClient();
+    const base44 = createClient({
+      appId: BASE44_APP_ID,
+      token,
+      serverUrl: "https://base44.app",
+    });
+
+    const user = await base44.auth.me();
+    if (!user || !user.id) {
+      return res.status(401).json({ error: "Invalid or expired authentication token" });
+    }
+
+    req.base44User = user;
+    return next();
+  } catch (error) {
+    console.error("[voice/auth] token validation failed:", error.message);
+    return res.status(401).json({ error: "Authentication failed" });
+  }
+}
 
 // ============================================================
 // HEALTH CHECK
@@ -34,13 +86,15 @@ app.get("/", (req, res) => {
 
 // ============================================================
 // TWILIO TOKEN
-// GET /token?identity=USERNAME
+// GET /token
+//
+// The token endpoint is authenticated with the Base44 access token.
+// The browser cannot impersonate another GlobalCall user by choosing
+// an arbitrary identity.
 // ============================================================
 
-app.get("/token", (req, res) => {
+app.get("/token", requireBase44User, (req, res) => {
   try {
-    const identity = String(req.query.identity || "user").trim();
-
     if (
       !TWILIO_ACCOUNT_SID ||
       !TWILIO_API_KEY ||
@@ -49,6 +103,32 @@ app.get("/token", (req, res) => {
     ) {
       return res.status(500).json({
         error: "Twilio server configuration is incomplete.",
+      });
+    }
+
+    const user = req.base44User;
+    const requestedIdentity = String(req.query.identity || "").trim();
+
+    // Compatible identities already used by GlobalCall users.
+    const allowedIdentities = new Set(
+      [
+        user.id,
+        user.globalcall_number,
+        user.extension,
+        user.username,
+        user.email,
+      ]
+        .filter(Boolean)
+        .map((value) => String(value).trim())
+    );
+
+    const identity = requestedIdentity
+      ? requestedIdentity
+      : String(user.globalcall_number || user.extension || user.id).trim();
+
+    if (!identity || !allowedIdentities.has(identity)) {
+      return res.status(403).json({
+        error: "The requested voice identity does not belong to this account.",
       });
     }
 
@@ -78,7 +158,6 @@ app.get("/token", (req, res) => {
     });
   } catch (error) {
     console.error("[token] Error:", error);
-
     return res.status(500).json({
       error: "Failed to generate Twilio token.",
     });
@@ -86,26 +165,63 @@ app.get("/token", (req, res) => {
 });
 
 // ============================================================
-// TWILIO VOICE
+// TWILIO VOICE WEBHOOK
 // POST /voice
 //
-// client:USER -> user-to-user
-// +234...     -> external PSTN
+// Internal calls: client:IDENTITY
+// Nigerian PSTN: +234XXXXXXXXXX / 0XXXXXXXXXX
+//
+// Twilio signature validation prevents arbitrary third parties from
+// using this endpoint as an unauthenticated voice-routing endpoint.
 // ============================================================
+
+function validateTwilioWebhook(req) {
+  if (!TWILIO_AUTH_TOKEN) return false;
+
+  const signature = req.headers["x-twilio-signature"];
+  if (!signature) return false;
+
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "https").split(",")[0];
+  const host = req.get("host");
+  const url = `${forwardedProto}://${host}${req.originalUrl}`;
+
+  return twilio.validateRequest(
+    TWILIO_AUTH_TOKEN,
+    signature,
+    url,
+    req.body
+  );
+}
+
+function normalizeNigeriaNumber(value) {
+  let number = String(value || "").trim().replace(/[\s().-]/g, "");
+
+  if (number.startsWith("00")) number = "+" + number.slice(2);
+  if (number.startsWith("234")) number = "+" + number;
+  if (/^0\d{10}$/.test(number)) number = "+234" + number.slice(1);
+
+  if (!/^\+234\d{10}$/.test(number)) return null;
+  return number;
+}
 
 app.post("/voice", (req, res) => {
   try {
+    if (!validateTwilioWebhook(req)) {
+      return res.status(403).type("text/plain").send("Invalid Twilio signature.");
+    }
+
     const to = String(req.body.To || "").trim();
-    const callerId = TWILIO_CALLER_ID || "+18384445450";
+    const callerId = TWILIO_CALLER_ID;
+
+    if (!callerId) {
+      return res.status(500).type("text/plain").send("Twilio caller ID is not configured.");
+    }
 
     const twiml = new twilio.twiml.VoiceResponse();
 
     if (!to) {
       twiml.say("No destination number provided.");
-
-      return res
-        .type("text/xml")
-        .send(twiml.toString());
+      return res.type("text/xml").send(twiml.toString());
     }
 
     const dial = twiml.dial({
@@ -115,44 +231,29 @@ app.post("/voice", (req, res) => {
 
     if (to.startsWith("client:")) {
       const clientId = to.replace(/^client:/, "").trim();
-
-      if (!clientId) {
+      if (!clientId || !/^[A-Za-z0-9_.:@+-]{1,128}$/.test(clientId)) {
         twiml.say("Invalid client destination.");
       } else {
         dial.client(clientId);
       }
     } else {
-      dial.number(to);
+      const nigeriaNumber = normalizeNigeriaNumber(to);
+      if (!nigeriaNumber) {
+        twiml.say("Only Nigerian destination numbers are supported.");
+      } else {
+        dial.number(nigeriaNumber);
+      }
     }
 
-    return res
-      .type("text/xml")
-      .send(twiml.toString());
+    return res.type("text/xml").send(twiml.toString());
   } catch (error) {
     console.error("[voice] Error:", error);
-
-    return res
-      .status(500)
-      .type("text/plain")
-      .send("Voice processing error.");
+    return res.status(500).type("text/plain").send("Voice processing error.");
   }
 });
 
 // ============================================================
 // SECURE WALLET ROUTES
-// ============================================================
-//
-// wallet.js handles:
-//   GET  /wallet/balance
-//   POST /wallet/intent
-//   POST /wallet/credit
-//   POST /wallet/precall
-//   POST /wallet/charge
-//   GET  /wallet/transactions
-//
-// IMPORTANT:
-// wallet.js authenticates the Base44 user using the Base44
-// access token supplied by the frontend.
 // ============================================================
 
 app.use(require("./wallet"));

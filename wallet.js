@@ -212,6 +212,46 @@ async function authMiddleware(req, res, next) {
 router.use(authMiddleware);
 
 // ============================================================
+// GET /wallet/public-key
+// Returns the Flutterwave PUBLIC key for browser checkout.
+// This endpoint is authenticated, but the key itself is not secret.
+// The Flutterwave SECRET key is never returned to the browser.
+// Render environment variable name: public_key
+// ============================================================
+
+router.get(
+  "/wallet/public-key",
+  async (req, res) => {
+    try {
+      const publicKey = String(
+        process.env.public_key || ""
+      ).trim();
+
+      if (!publicKey) {
+        return res.status(500).json({
+          error: "Flutterwave public key is not configured.",
+        });
+      }
+
+      if (!publicKey.startsWith("FLWPUBK-")) {
+        return res.status(500).json({
+          error: "Flutterwave public key configuration is invalid.",
+        });
+      }
+
+      return res.json({
+        public_key: publicKey,
+      });
+    } catch (error) {
+      console.error("[wallet/public-key] Error:", error);
+      return res.status(500).json({
+        error: "Could not load Flutterwave public key.",
+      });
+    }
+  }
+);
+
+// ============================================================
 // NIGERIAN NETWORK DETECTION
 // ============================================================
 

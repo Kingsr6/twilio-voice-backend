@@ -16,15 +16,16 @@ app.use(express.urlencoded({ extended: false }));
 // ENVIRONMENT VARIABLES
 // ============================================================
 
-const {
-  TWILIO_ACCOUNT_SID,
-  TWILIO_API_KEY,
-  TWILIO_API_SECRET,
-  TWILIO_TWIML_APP_SID,
-  TWILIO_CALLER_ID,
-  TWILIO_AUTH_TOKEN,
-  BASE44_APP_ID,
-} = process.env;
+// Trim environment values so trailing spaces/newlines pasted into Render do not
+// corrupt Twilio credential signing or webhook validation.
+const envValue = (name) => String(process.env[name] || "").trim();
+const TWILIO_ACCOUNT_SID = envValue("TWILIO_ACCOUNT_SID");
+const TWILIO_API_KEY = envValue("TWILIO_API_KEY");
+const TWILIO_API_SECRET = envValue("TWILIO_API_SECRET");
+const TWILIO_TWIML_APP_SID = envValue("TWILIO_TWIML_APP_SID");
+const TWILIO_CALLER_ID = envValue("TWILIO_CALLER_ID");
+const TWILIO_AUTH_TOKEN = envValue("TWILIO_AUTH_TOKEN");
+const BASE44_APP_ID = envValue("BASE44_APP_ID");
 
 // ============================================================
 // BASE44 AUTH FOR VOICE TOKEN
@@ -93,40 +94,84 @@ app.get("/", (req, res) => {
 // an arbitrary identity.
 // ============================================================
 
-app.get("/token", requireBase44User, (req, res) => {
+// Validate the key/secret pair and TwiML App against the configured account.
+// Cache successful validation briefly to avoid an extra Twilio API call on every token.
+let twilioCredentialsVerifiedAt = 0;
+let twilioCredentialsVerificationPromise = null;
+const TWILIO_CREDENTIALS_CACHE_MS = 5 * 60 * 1000;
+
+async function verifyTwilioCredentials() {
+  if (Date.now() - twilioCredentialsVerifiedAt < TWILIO_CREDENTIALS_CACHE_MS) return;
+  if (twilioCredentialsVerificationPromise) return twilioCredentialsVerificationPromise;
+
+  twilioCredentialsVerificationPromise = (async () => {
+    if (!/^AC[0-9a-fA-F]{32}$/.test(TWILIO_ACCOUNT_SID)) {
+      throw new Error("TWILIO_ACCOUNT_SID must be an Account SID beginning with AC.");
+    }
+    if (!/^SK[0-9a-fA-F]{32}$/.test(TWILIO_API_KEY)) {
+      throw new Error("TWILIO_API_KEY must be an API Key SID beginning with SK, not the Account SID.");
+    }
+    if (!TWILIO_API_SECRET || /^(AC|SK|AP)[0-9a-fA-F]{32}$/.test(TWILIO_API_SECRET)) {
+      throw new Error("TWILIO_API_SECRET must contain the API key secret, not a SID.");
+    }
+    if (!/^AP[0-9a-fA-F]{32}$/.test(TWILIO_TWIML_APP_SID)) {
+      throw new Error("TWILIO_TWIML_APP_SID must be a TwiML App SID beginning with AP.");
+    }
+
+    const client = twilio(TWILIO_API_KEY, TWILIO_API_SECRET, {
+      accountSid: TWILIO_ACCOUNT_SID,
+    });
+    try {
+      await client.api.v2010.account.fetch();
+    } catch (_) {
+      throw new Error("Twilio rejected the API key/secret for the configured account. Check that TWILIO_API_KEY and TWILIO_API_SECRET are a matching pair belonging to TWILIO_ACCOUNT_SID.");
+    }
+    try {
+      await client.applications(TWILIO_TWIML_APP_SID).fetch();
+    } catch (_) {
+      throw new Error("Twilio could not find the configured TwiML App under this account. Check TWILIO_TWIML_APP_SID and ensure it belongs to TWILIO_ACCOUNT_SID.");
+    }
+    twilioCredentialsVerifiedAt = Date.now();
+  })();
+
   try {
-    if (
-      !TWILIO_ACCOUNT_SID ||
-      !TWILIO_API_KEY ||
-      !TWILIO_API_SECRET ||
-      !TWILIO_TWIML_APP_SID
-    ) {
+    await twilioCredentialsVerificationPromise;
+  } finally {
+    twilioCredentialsVerificationPromise = null;
+  }
+}
+
+app.get("/token", requireBase44User, async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+
+  try {
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET || !TWILIO_TWIML_APP_SID) {
       return res.status(500).json({
-        error: "Twilio server configuration is incomplete.",
+        error: "Twilio server configuration is incomplete. Required: TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_TWIML_APP_SID.",
       });
     }
 
+    await verifyTwilioCredentials();
+
     const user = req.base44User;
     const requestedIdentity = String(req.query.identity || "").trim();
-
-    // Compatible identities already used by GlobalCall users.
     const allowedIdentities = new Set(
-      [
-        user.id,
-        user.globalcall_number,
-        user.extension,
-        user.username,
-        user.email,
-      ]
+      [user.id, user.globalcall_number, user.extension, user.username, user.email]
         .filter(Boolean)
         .map((value) => String(value).trim())
     );
-
     const identity = requestedIdentity
       ? requestedIdentity
       : String(user.globalcall_number || user.extension || user.id).trim();
 
-    if (!identity || !allowedIdentities.has(identity)) {
+    if (!identity || identity.length > 121 || !/^[A-Za-z0-9_.:@+-]+$/.test(identity)) {
+      return res.status(400).json({
+        error: "The voice identity is invalid. Use a short identity containing only letters, numbers, underscores, dots, colons, @, +, or hyphens.",
+      });
+    }
+    if (!allowedIdentities.has(identity)) {
       return res.status(403).json({
         error: "The requested voice identity does not belong to this account.",
       });
@@ -134,38 +179,31 @@ app.get("/token", requireBase44User, (req, res) => {
 
     const AccessToken = twilio.jwt.AccessToken;
     const VoiceGrant = AccessToken.VoiceGrant;
-
     const voiceGrant = new VoiceGrant({
       outgoingApplicationSid: TWILIO_TWIML_APP_SID,
       incomingAllow: true,
     });
-
     const token = new AccessToken(
       TWILIO_ACCOUNT_SID,
       TWILIO_API_KEY,
       TWILIO_API_SECRET,
-      {
-        identity,
-        ttl: 3600,
-      }
+      { identity, ttl: 3600 }
     );
-
     token.addGrant(voiceGrant);
 
-    return res.json({
-      token: token.toJwt(),
-      identity,
-    });
+    const jwt = token.toJwt();
+    console.log(`[token] issued voice token identity=${identity} account=${TWILIO_ACCOUNT_SID.slice(0, 8)} apiKey=${TWILIO_API_KEY.slice(0, 8)} ttl=3600s`);
+    return res.json({ token: jwt, identity, expires_in: 3600 });
   } catch (error) {
-    console.error("[token] Error:", error);
+    const message = error && error.message ? error.message : "Unknown token generation error";
+    console.error("[token] Token generation failed:", message);
     return res.status(500).json({
-      error: "Failed to generate Twilio token.",
+      error: message.startsWith("TWILIO_") || message.startsWith("Twilio ")
+        ? message
+        : "Failed to generate Twilio token. Check the Twilio credential configuration.",
     });
   }
-});
-
-// ============================================================
-// TWILIO VOICE WEBHOOK
+});OOK
 // POST /voice
 //
 // Internal calls: client:IDENTITY

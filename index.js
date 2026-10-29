@@ -94,53 +94,6 @@ app.get("/", (req, res) => {
 // an arbitrary identity.
 // ============================================================
 
-// Validate the key/secret pair and TwiML App against the configured account.
-// Cache successful validation briefly to avoid an extra Twilio API call on every token.
-let twilioCredentialsVerifiedAt = 0;
-let twilioCredentialsVerificationPromise = null;
-const TWILIO_CREDENTIALS_CACHE_MS = 5 * 60 * 1000;
-
-async function verifyTwilioCredentials() {
-  if (Date.now() - twilioCredentialsVerifiedAt < TWILIO_CREDENTIALS_CACHE_MS) return;
-  if (twilioCredentialsVerificationPromise) return twilioCredentialsVerificationPromise;
-
-  twilioCredentialsVerificationPromise = (async () => {
-    if (!/^AC[0-9a-fA-F]{32}$/.test(TWILIO_ACCOUNT_SID)) {
-      throw new Error("TWILIO_ACCOUNT_SID must be an Account SID beginning with AC.");
-    }
-    if (!/^SK[0-9a-fA-F]{32}$/.test(TWILIO_API_KEY)) {
-      throw new Error("TWILIO_API_KEY must be an API Key SID beginning with SK, not the Account SID.");
-    }
-    if (!TWILIO_API_SECRET || /^(AC|SK|AP)[0-9a-fA-F]{32}$/.test(TWILIO_API_SECRET)) {
-      throw new Error("TWILIO_API_SECRET must contain the API key secret, not a SID.");
-    }
-    if (!/^AP[0-9a-fA-F]{32}$/.test(TWILIO_TWIML_APP_SID)) {
-      throw new Error("TWILIO_TWIML_APP_SID must be a TwiML App SID beginning with AP.");
-    }
-
-    const client = twilio(TWILIO_API_KEY, TWILIO_API_SECRET, {
-      accountSid: TWILIO_ACCOUNT_SID,
-    });
-    try {
-      await client.api.v2010.account.fetch();
-    } catch (_) {
-      throw new Error("Twilio rejected the API key/secret for the configured account. Check that TWILIO_API_KEY and TWILIO_API_SECRET are a matching pair belonging to TWILIO_ACCOUNT_SID.");
-    }
-    try {
-      await client.applications(TWILIO_TWIML_APP_SID).fetch();
-    } catch (_) {
-      throw new Error("Twilio could not find the configured TwiML App under this account. Check TWILIO_TWIML_APP_SID and ensure it belongs to TWILIO_ACCOUNT_SID.");
-    }
-    twilioCredentialsVerifiedAt = Date.now();
-  })();
-
-  try {
-    await twilioCredentialsVerificationPromise;
-  } finally {
-    twilioCredentialsVerificationPromise = null;
-  }
-}
-
 app.get("/token", requireBase44User, async (req, res) => {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
   res.set("Pragma", "no-cache");
@@ -152,8 +105,6 @@ app.get("/token", requireBase44User, async (req, res) => {
         error: "Twilio server configuration is incomplete. Required: TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_TWIML_APP_SID.",
       });
     }
-
-    await verifyTwilioCredentials();
 
     const user = req.base44User;
     const requestedIdentity = String(req.query.identity || "").trim();

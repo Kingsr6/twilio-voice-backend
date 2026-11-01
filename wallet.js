@@ -1,5 +1,6 @@
 const express = require("express");
 const { Pool } = require("pg");
+const twilio = require("twilio");
 
 const router = express.Router();
 
@@ -10,6 +11,8 @@ const router = express.Router();
 const DATABASE_URL = process.env.DATABASE_URL;
 const BASE44_APP_ID = process.env.BASE44_APP_ID;
 const FLW_SECRET_KEY = process.env.FLW_SECRET_KEY;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 
 if (!DATABASE_URL) {
   console.error("[wallet] DATABASE_URL is missing.");
@@ -105,6 +108,10 @@ async function initSchema() {
 
     CREATE INDEX IF NOT EXISTS idx_call_charges_user
       ON call_charges(user_id);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_call_charges_provider_call_id
+      ON call_charges(provider_call_id)
+      WHERE provider_call_id IS NOT NULL;
 
     CREATE INDEX IF NOT EXISTS idx_migration_audit_status
       ON migration_audit(status);
@@ -426,6 +433,100 @@ function calculateCost(
       Number(ratePerMinute)
     ).toFixed(2)
   );
+}
+
+// ============================================================
+// AUTHORITATIVE TWILIO CALL VERIFICATION
+// ============================================================
+
+function normalizeNigeriaNumberForBilling(value) {
+  let number = String(value || "").trim().replace(/[\s().-]/g, "");
+  if (number.startsWith("00")) number = "+" + number.slice(2);
+  if (number.startsWith("234")) number = "+" + number;
+  if (/^0\d{10}$/.test(number)) number = "+234" + number.slice(1);
+  return /^\+234\d{10}$/.test(number) ? number : null;
+}
+
+async function getVerifiedCompletedCall(providerCallId, destinationNumber) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    const error = new Error("Twilio server credentials are not configured.");
+    error.statusCode = 503;
+    throw error;
+  }
+
+  if (!/^CA[0-9a-f]{32}$/i.test(String(providerCallId || ""))) {
+    const error = new Error("A valid Twilio call ID is required.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const expectedDestination = normalizeNigeriaNumberForBilling(destinationNumber);
+  if (!expectedDestination) {
+    const error = new Error("A valid Nigerian destination number is required.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+  let providerCall;
+
+  try {
+    providerCall = await client.calls(providerCallId).fetch();
+  } catch (cause) {
+    const error = new Error("Could not verify this call with Twilio.");
+    error.statusCode = 502;
+    error.cause = cause;
+    throw error;
+  }
+
+  // The Voice SDK can return the parent client leg. In that case, find the
+  // matching completed PSTN child leg and bill its authoritative duration.
+  let billableCall = providerCall;
+  const providerDestination = normalizeNigeriaNumberForBilling(providerCall.to);
+
+  if (providerDestination !== expectedDestination) {
+    let childCalls;
+    try {
+      childCalls = await client.calls.list({
+        parentCallSid: providerCallId,
+        limit: 20,
+      });
+    } catch (cause) {
+      const error = new Error("Could not verify the destination leg with Twilio.");
+      error.statusCode = 502;
+      error.cause = cause;
+      throw error;
+    }
+
+    billableCall = (childCalls || []).find((call) =>
+      normalizeNigeriaNumberForBilling(call.to) === expectedDestination
+    );
+
+    if (!billableCall) {
+      const error = new Error("Twilio could not confirm a call to this destination.");
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+
+  if (billableCall.status !== "completed") {
+    const error = new Error("Only completed calls can be charged.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const duration = Number(billableCall.duration);
+  if (!Number.isFinite(duration) || duration < 0) {
+    const error = new Error("Twilio returned an invalid call duration.");
+    error.statusCode = 502;
+    throw error;
+  }
+
+  return {
+    durationSeconds: Math.floor(duration),
+    providerCallId: billableCall.sid,
+    status: billableCall.status,
+  };
 }
 
 // ============================================================
@@ -963,30 +1064,28 @@ router.post(
     const userId =
       req.authUserId;
 
-    if (
-      !call_log_id ||
-      !destination_number ||
-      duration_seconds ===
-        undefined
-    ) {
+    if (!call_log_id || !destination_number || !provider_call_id) {
       return res.status(400).json({
-        error:
-          "call_log_id, destination_number and duration_seconds are required.",
+        charged: false,
+        error: "call_log_id, destination_number and provider_call_id are required.",
       });
     }
 
-    const duration =
-      Number(duration_seconds);
-
-    if (
-      !Number.isFinite(duration) ||
-      duration < 0
-    ) {
-      return res.status(400).json({
-        error:
-          "duration_seconds must be a valid non-negative number.",
+    let verifiedCall;
+    try {
+      verifiedCall = await getVerifiedCompletedCall(provider_call_id, destination_number);
+    } catch (error) {
+      console.error("[wallet/charge] Twilio verification failed:", error.message);
+      return res.status(error.statusCode || 502).json({
+        charged: false,
+        error: error.statusCode === 400 || error.statusCode === 503
+          ? error.message
+          : "Could not verify the completed call with Twilio.",
       });
     }
+
+    // Never accept client-reported duration for billing.
+    const duration = verifiedCall.durationSeconds;
 
     try {
       // --------------------------------------------------------
@@ -998,9 +1097,10 @@ router.post(
           `
             SELECT *
             FROM call_charges
-            WHERE call_log_id = $1
+            WHERE (call_log_id = $1 OR provider_call_id = $2)
+              AND user_id = $3
           `,
-          [call_log_id]
+          [call_log_id, verifiedCall.providerCallId, userId]
         );
 
       if (
@@ -1183,8 +1283,7 @@ router.post(
             ratePerMinute,
             cost,
             "twilio",
-            provider_call_id ||
-              null,
+            verifiedCall.providerCallId,
           ]
         );
 
@@ -1205,34 +1304,29 @@ router.post(
               `
                 SELECT *
                 FROM call_charges
-                WHERE call_log_id = $1
+                WHERE call_log_id = $1 OR provider_call_id = $2
+                LIMIT 1
               `,
-              [call_log_id]
+              [call_log_id, verifiedCall.providerCallId]
             );
 
-          if (
-            existing2.rows.length >
-            0
-          ) {
-            const charge =
-              existing2.rows[0];
+          if (existing2.rows.length > 0) {
+            const charge = existing2.rows[0];
+
+            if (charge.user_id !== userId) {
+              return res.status(409).json({
+                charged: false,
+                error: "This call has already been processed.",
+              });
+            }
 
             return res.json({
               charged: false,
               idempotent: true,
-              cost: Number(
-                charge.amount
-              ),
-              billedMinutes:
-                Number(
-                  charge.billed_minutes
-                ),
-              ratePerMinute:
-                Number(
-                  charge.rate_per_minute
-                ),
-              network:
-                charge.destination_network,
+              cost: Number(charge.amount),
+              billedMinutes: Number(charge.billed_minutes),
+              ratePerMinute: Number(charge.rate_per_minute),
+              network: charge.destination_network,
             });
           }
         }

@@ -7,7 +7,8 @@ const pool = new Pool({
   max: 5,
 });
 
-const SIGNAL_TYPES = new Set(["offer", "answer", "ice-candidate", "reject", "hangup"]);
+const SIGNAL_TYPES = new Set(["offer", "answer", "ice-candidate"]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CALL_STATES = new Set(["accepted", "rejected", "ended", "missed"]);
 
 function cleanText(value, max = 120) {
@@ -19,6 +20,8 @@ async function ensureIdentity(user) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // Serialize provisioning for this account, including the first insert when no row exists.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [userId]);
     const found = await client.query(
       "SELECT user_id, gc_id, status FROM public.private_identities WHERE user_id = $1 FOR UPDATE",
       [userId]
@@ -148,7 +151,7 @@ module.exports = function createPrivateCallingRouter(requireBase44User) {
   router.post("/private/calls/:callId/state", async (req, res) => {
     try {
       const identity = await ensureIdentity(req.base44User);
-      const nextState = cleanText(req.body.status, 16);
+      const nextState = cleanText(req.body?.status, 16);
       if (!CALL_STATES.has(nextState)) return res.status(400).json({ error: "Invalid call state" });
       const update = await pool.query(
         `UPDATE public.private_call_sessions
@@ -175,10 +178,10 @@ module.exports = function createPrivateCallingRouter(requireBase44User) {
   router.post("/private/signals", async (req, res) => {
     try {
       const identity = await ensureIdentity(req.base44User);
-      const callId = cleanText(req.body.call_id, 40);
-      const signalType = cleanText(req.body.signal_type, 24);
-      const payload = req.body.payload && typeof req.body.payload === "object" && !Array.isArray(req.body.payload) ? req.body.payload : null;
-      if (!callId || !SIGNAL_TYPES.has(signalType) || !payload) return res.status(400).json({ error: "Invalid signaling message" });
+      const callId = cleanText(req.body?.call_id, 40);
+      const signalType = cleanText(req.body?.signal_type, 24);
+      const payload = req.body?.payload && typeof req.body.payload === "object" && !Array.isArray(req.body.payload) ? req.body.payload : null;
+      if (!UUID_RE.test(callId) || !SIGNAL_TYPES.has(signalType) || !payload) return res.status(400).json({ error: "Invalid signaling message" });
       if (JSON.stringify(payload).length > 16000) return res.status(413).json({ error: "Signaling payload is too large" });
 
       const call = await pool.query(
@@ -188,7 +191,10 @@ module.exports = function createPrivateCallingRouter(requireBase44User) {
       if (!call.rowCount) return res.status(404).json({ error: "Call not found" });
       const row = call.rows[0];
       if (identity.user_id !== row.caller_user_id && identity.user_id !== row.receiver_user_id) return res.status(403).json({ error: "Not a participant in this call" });
-      if (["ended","rejected","missed","failed"].includes(row.status)) return res.status(409).json({ error: "Call is no longer active" });
+      if (!["ringing", "accepted"].includes(row.status)) return res.status(409).json({ error: "Call is no longer active" });
+      if (signalType === "offer" && identity.user_id !== row.caller_user_id) return res.status(403).json({ error: "Only the caller can send an offer" });
+      if (signalType === "answer" && (identity.user_id !== row.receiver_user_id || row.status !== "accepted")) return res.status(403).json({ error: "Only the accepted receiver can send an answer" });
+      if (signalType === "ice-candidate" && row.status !== "accepted") return res.status(409).json({ error: "ICE candidates can only be exchanged after the call is accepted" });
       const recipient = identity.user_id === row.caller_user_id ? row.receiver_user_id : row.caller_user_id;
       const saved = await pool.query(
         "INSERT INTO public.private_call_signals(call_id,sender_user_id,recipient_user_id,signal_type,payload) VALUES($1,$2,$3,$4,$5::jsonb) RETURNING id,created_at",
@@ -205,6 +211,7 @@ module.exports = function createPrivateCallingRouter(requireBase44User) {
     try {
       const identity = await ensureIdentity(req.base44User);
       const callId = cleanText(req.params.callId, 40);
+      if (!UUID_RE.test(callId)) return res.status(400).json({ error: "Invalid call ID" });
       const participant = await pool.query(
         "SELECT 1 FROM public.private_call_sessions WHERE call_id=$1 AND (caller_user_id=$2 OR receiver_user_id=$2)",
         [callId, identity.user_id]

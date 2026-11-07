@@ -151,6 +151,7 @@ module.exports = function createPrivateCallingRouter(requireBase44User) {
   router.post("/private/calls/:callId/state", async (req, res) => {
     try {
       const identity = await ensureIdentity(req.base44User);
+      if (!UUID_RE.test(req.params.callId)) return res.status(400).json({ error: "Invalid call ID" });
       const nextState = cleanText(req.body?.status, 16);
       if (!CALL_STATES.has(nextState)) return res.status(400).json({ error: "Invalid call state" });
       const update = await pool.query(

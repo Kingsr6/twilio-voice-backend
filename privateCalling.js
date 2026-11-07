@@ -69,6 +69,10 @@ async function ensureIdentity(user) {
 module.exports = function createPrivateCallingRouter(requireBase44User) {
   const router = express.Router();
   router.use(requireBase44User);
+  router.use((req, res, next) => {
+    if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) req.body = {};
+    next();
+  });
 
   router.get("/private/me", async (req, res) => {
     try {

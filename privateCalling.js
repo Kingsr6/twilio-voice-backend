@@ -137,6 +137,11 @@ module.exports = function createPrivateCallingRouter(requireBase44User) {
   router.get("/private/calls/incoming", async (req, res) => {
     try {
       const identity = await ensureIdentity(req.base44User);
+      // Expire unanswered invitations so stale calls do not ring forever.
+      await pool.query(
+        "UPDATE public.private_call_sessions SET status='missed',ended_at=NOW(),ended_by_user_id=receiver_user_id WHERE receiver_user_id=$1 AND status='ringing' AND created_at < NOW() - INTERVAL '45 seconds'",
+        [identity.user_id]
+      );
       const result = await pool.query(
         "SELECT c.call_id,c.status,c.created_at,i.gc_id AS caller_gc_id,d.display_name AS caller_name FROM public.private_call_sessions c JOIN public.private_identities i ON i.user_id=c.caller_user_id JOIN public.private_directory d ON d.gc_id=i.gc_id WHERE c.receiver_user_id=$1 AND c.status='ringing' ORDER BY c.created_at DESC LIMIT 20",
         [identity.user_id]

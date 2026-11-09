@@ -40,11 +40,20 @@ async function ensureIdentity(user) {
         "UPDATE public.private_id_counters SET last_value = GREATEST(last_value, 10000001), updated_at = NOW() WHERE counter_name = 'globalcaller_gc_id'"
       );
     } else {
-      const counter = await client.query(
-        "UPDATE public.private_id_counters SET last_value = last_value + 1, updated_at = NOW() WHERE counter_name = 'globalcaller_gc_id' RETURNING last_value"
-      );
-      if (!counter.rowCount) throw new Error("GlobalCall ID counter is not initialized");
-      gcId = "GC-" + String(counter.rows[0].last_value).padStart(8, "0");
+      // Reserved GlobalCall IDs are skipped by automatic registration.
+      // The counter row serializes allocation across concurrent registrations.
+      while (!gcId) {
+        const counter = await client.query(
+          "UPDATE public.private_id_counters SET last_value = last_value + 1, updated_at = NOW() WHERE counter_name = 'globalcaller_gc_id' RETURNING last_value"
+        );
+        if (!counter.rowCount) throw new Error("GlobalCall ID counter is not initialized");
+        const candidate = "GC-" + String(counter.rows[0].last_value).padStart(8, "0");
+        const reserved = await client.query(
+          "SELECT 1 FROM public.private_gc_id_reservations WHERE gc_id = $1",
+          [candidate]
+        );
+        if (!reserved.rowCount) gcId = candidate;
+      }
     }
 
     const identity = await client.query(

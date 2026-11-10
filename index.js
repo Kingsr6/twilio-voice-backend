@@ -245,6 +245,13 @@ app.post("/voice", (req, res) => {
 });
 
 // ============================================================
+// PRIVATE GLOBALCALL CALLING ROUTES
+// Uses the same validated Base44 user identity as wallet and voice routes.
+// ============================================================
+
+app.use(require("./privateCalling")(requireBase44User));
+
+// ============================================================
 // SECURE WALLET ROUTES
 // ============================================================
 

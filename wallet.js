@@ -23,12 +23,19 @@ if (!FLW_SECRET_KEY) {
   console.error("[wallet] FLW_SECRET_KEY is missing.");
 }
 
+// Explicitly request full TLS certificate and hostname verification in production.
+let secureDatabaseUrl = DATABASE_URL;
+if (DATABASE_URL && process.env.NODE_ENV === "production") {
+  const parsedDatabaseUrl = new URL(DATABASE_URL);
+  parsedDatabaseUrl.searchParams.set("sslmode", "verify-full");
+  secureDatabaseUrl = parsedDatabaseUrl.toString();
+}
+
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl:
-    process.env.NODE_ENV === "production"
-      ? { rejectUnauthorized: false }
-      : false,
+  connectionString: secureDatabaseUrl,
+  ssl: process.env.NODE_ENV === "production"
+    ? { rejectUnauthorized: true }
+    : false,
 });
 
 // ============================================================
@@ -207,6 +214,35 @@ async function authMiddleware(req, res, next) {
     });
   }
 }
+
+// Per-instance abuse protection. Use a shared store before horizontal scaling.
+function createRateLimiter({ windowMs, max, key = (req) => req.ip, message }) {
+  const buckets = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    const bucketKey = String(key(req) || "unknown");
+    let bucket = buckets.get(bucketKey);
+    if (!bucket || now >= bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + windowMs };
+      buckets.set(bucketKey, bucket);
+    }
+    bucket.count += 1;
+    res.set("RateLimit-Limit", String(max));
+    res.set("RateLimit-Remaining", String(Math.max(0, max - bucket.count)));
+    res.set("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+    if (bucket.count > max) {
+      res.set("Retry-After", String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+      return res.status(429).json({ error: message || "Too many requests. Please try again shortly." });
+    }
+    if (buckets.size > 5000) {
+      for (const [key, value] of buckets) if (now >= value.resetAt) buckets.delete(key);
+    }
+    return next();
+  };
+}
+
+// Apply an IP limit before Base44 auth so invalid-token floods are bounded.
+router.use(createRateLimiter({ windowMs: 60 * 1000, max: 120 }));
 
 // All wallet routes require authentication.
 router.use(authMiddleware);
@@ -501,6 +537,7 @@ router.get(
 
 router.post(
   "/wallet/intent",
+  createRateLimiter({ windowMs: 10 * 60 * 1000, max: 5, key: (req) => req.authUserId || req.ip, message: "Too many funding attempts. Please wait before trying again." }),
   async (req, res) => {
     const amount =
       Number(req.body.amount);
@@ -599,6 +636,7 @@ router.post(
 
 router.post(
   "/wallet/credit",
+  createRateLimiter({ windowMs: 10 * 60 * 1000, max: 10, key: (req) => req.authUserId || req.ip, message: "Too many payment verification attempts. Please wait before trying again." }),
   async (req, res) => {
     const { tx_ref, transaction_id, flw_ref } = req.body;
     const userId = req.authUserId;

@@ -4,7 +4,8 @@
   "description": "GlobalCall secure voice, wallet and billing backend",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check": "node --check index.js && node --check wallet.js"
   },
   "dependencies": {
     "@base44/sdk": "^0.8.46",

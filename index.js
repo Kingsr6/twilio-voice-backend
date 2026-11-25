@@ -11,12 +11,13 @@ const app = express();
 // Render terminates TLS and forwards the original client address.
 app.set("trust proxy", 1);
 
-const allowedOrigins = new Set(
-  String(process.env.GLOBALCALL_ALLOWED_ORIGINS || "")
+const allowedOrigins = new Set([
+  "https://globalcaller.base44.app",
+  ...String(process.env.GLOBALCALL_ALLOWED_ORIGINS || "")
     .split(",")
     .map((origin) => origin.trim())
-    .filter(Boolean)
-);
+    .filter(Boolean),
+]);
 
 app.use(cors({
   origin(origin, callback) {

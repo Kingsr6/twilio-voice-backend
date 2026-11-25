@@ -8,7 +8,28 @@ const app = express();
 // MIDDLEWARE
 // ============================================================
 
-app.use(cors({ origin: "*" }));
+// Render terminates TLS and forwards the original client address.
+app.set("trust proxy", 1);
+
+const allowedOrigins = new Set([
+  "https://globalcaller.base44.app",
+  ...String(process.env.GLOBALCALL_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+]);
+
+app.use(cors({
+  origin(origin, callback) {
+    // Non-browser requests (including Twilio webhooks) do not send Origin.
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error("Origin not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type"],
+  credentials: false,
+  maxAge: 600,
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
@@ -26,6 +47,40 @@ const TWILIO_TWIML_APP_SID = envValue("TWILIO_TWIML_APP_SID");
 const TWILIO_CALLER_ID = envValue("TWILIO_CALLER_ID");
 const TWILIO_AUTH_TOKEN = envValue("TWILIO_AUTH_TOKEN");
 const BASE44_APP_ID = envValue("BASE44_APP_ID");
+
+// Small per-instance fixed-window limiter. Render currently runs one instance;
+// use a shared store before scaling to multiple instances.
+function createRateLimiter({ windowMs, max, key = (req) => req.ip, message }) {
+  const buckets = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    const bucketKey = String(key(req) || "unknown");
+    let bucket = buckets.get(bucketKey);
+    if (!bucket || now >= bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + windowMs };
+      buckets.set(bucketKey, bucket);
+    }
+    bucket.count += 1;
+    res.set("RateLimit-Limit", String(max));
+    res.set("RateLimit-Remaining", String(Math.max(0, max - bucket.count)));
+    res.set("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+    if (bucket.count > max) {
+      res.set("Retry-After", String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+      return res.status(429).json({ error: message || "Too many requests. Please try again shortly." });
+    }
+    // Periodically discard expired buckets to bound memory use.
+    if (buckets.size > 5000) {
+      for (const [key, value] of buckets) if (now >= value.resetAt) buckets.delete(key);
+    }
+    return next();
+  };
+}
+
+const tokenRateLimit = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 20,
+  message: "Too many voice-token requests. Please wait before trying again.",
+});
 
 // ============================================================
 // BASE44 AUTH FOR VOICE TOKEN
@@ -94,7 +149,7 @@ app.get("/", (req, res) => {
 // an arbitrary identity.
 // ============================================================
 
-app.get("/token", requireBase44User, async (req, res) => {
+app.get("/token", tokenRateLimit, requireBase44User, async (req, res) => {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
@@ -143,7 +198,7 @@ app.get("/token", requireBase44User, async (req, res) => {
     token.addGrant(voiceGrant);
 
     const jwt = token.toJwt();
-    console.log(`[token] issued voice token identity=${identity} account=${TWILIO_ACCOUNT_SID.slice(0, 8)} apiKey=${TWILIO_API_KEY.slice(0, 8)} ttl=3600s`);
+    console.log("[token] Voice token issued successfully; ttl=3600s");
     return res.json({ token: jwt, identity, expires_in: 3600 });
   } catch (error) {
     const message = error && error.message ? error.message : "Unknown token generation error";
